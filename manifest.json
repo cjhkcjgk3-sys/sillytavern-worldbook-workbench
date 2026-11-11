@@ -1,0 +1,11 @@
+{
+  "display_name": "世界书协作工作台",
+  "loading_order": 100,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Worldbook Workbench",
+  "version": "0.1.0",
+  "homePage": "https://github.com/cjhkcjgk3-sys/sillytavern-worldbook-workbench",
+  "minimum_client_version": "1.19.0",
+  "hooks": { "activate": "activate", "disable": "disable", "clean": "disable" }
+}

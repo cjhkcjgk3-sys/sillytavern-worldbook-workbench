@@ -1,0 +1,13 @@
+#worldbook-workbench .wbw-content {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 18em;
+    overflow: auto;
+    padding: 0.5em;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 4px;
+    font: inherit;
+}
+#worldbook-workbench .wbw-record { margin: 0.6em 0; }
+#worldbook-workbench .wbw-status { margin: 0.5em 0; overflow-wrap: anywhere; }
+#worldbook-workbench select { width: 100%; }
