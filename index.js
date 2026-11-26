@@ -8,6 +8,9 @@ const ID = 'worldbook_workbench';
 const STORAGE = 'worldbook_workbench_v1';
 const TOOL_NAMES = ['worldbook_workbench_search', 'worldbook_workbench_read', 'worldbook_workbench_write'];
 let root;
+let menuEntry;
+let openPopup;
+let entryLoad;
 let app;
 let active = false;
 let pendingMessage;
@@ -17,7 +20,7 @@ const WORK_RECORD = 'worldbook_workbench_mode';
 const ctx = () => SillyTavern.getContext();
 const settings = () => {
     const all = ctx().extensionSettings;
-    all[ID] ??= { enabled: false, book: '', mode: 'review' };
+    all[ID] ??= { enabled: false, book: '', mode: 'direct' };
     return all[ID];
 };
 function loadState() {
@@ -65,6 +68,10 @@ function supportsWorkMode(context) {
     return Boolean(context.chatId && !context.groupId && context.chatMetadata && typeof context.saveReply === 'function'
         && typeof context.saveChat === 'function');
 }
+function selectedTarget(book, context = ctx()) {
+    const target = workState(context)?.target;
+    return target?.book === book && Number.isSafeInteger(target.uid) ? target : undefined;
+}
 function renderWorkMode() {
     if (!root) return;
     const context = ctx();
@@ -87,11 +94,12 @@ function changeChat() {
     pendingMessage = undefined;
     stopWork();
     renderWorkMode();
+    if (openPopup) void populateEntries();
 }
-async function requestWorkReply(messages, signal, api, model) {
+async function requestWorkReply(messages, signal, api, model, toolNames) {
     const { generate_data } = await createGenerationParameters(api, model, 'normal', structuredClone(messages));
-    generate_data.tools = generate_data.tools?.filter(tool => TOOL_NAMES.includes(tool.function?.name));
-    if (generate_data.tools?.length !== TOOL_NAMES.length) throw new Error('当前请求没有启用完整的工作台工具。');
+    generate_data.tools = generate_data.tools?.filter(tool => toolNames.includes(tool.function?.name));
+    if (generate_data.tools?.length !== toolNames.length) throw new Error('当前请求没有启用完整的工作台工具。');
     const response = await fetch('/api/backends/chat-completions/generate', {
         method: 'POST',
         headers: ctx().getRequestHeaders(),
@@ -127,6 +135,8 @@ async function interceptGeneration(_chat, _contextSize, abort, type) {
     const { signal } = controller;
     const { chatId, characterId } = context;
     const { enabled, book, mode } = settings();
+    const target = selectedTarget(book, context);
+    const toolNames = target ? TOOL_NAMES.slice(1) : TOOL_NAMES;
     const belongsToChat = () => {
         const current = ctx();
         return active && current.chatId === chatId && current.characterId === characterId && !current.groupId
@@ -134,7 +144,8 @@ async function interceptGeneration(_chat, _contextSize, abort, type) {
     };
     const assertScope = () => {
         signal.throwIfAborted();
-        if (!belongsToChat() || !workState()?.enabled || !settings().enabled || settings().book !== book || settings().mode !== mode) {
+        if (!belongsToChat() || !workState()?.enabled || !settings().enabled || settings().book !== book || settings().mode !== mode
+            || selectedTarget(book)?.uid !== target?.uid) {
             throw new Error('聊天、世界书或工作方式已切换，已结束本次任务。');
         }
     };
@@ -151,16 +162,30 @@ async function interceptGeneration(_chat, _contextSize, abort, type) {
             throw new Error('当前工作模式需要启用函数调用的 OpenAI 或自定义聊天补全连接。');
         }
         const maxToolRounds = Math.min(50, Math.max(1, Math.floor(Number(api.tool_call_recurse_limit) || 5)));
+        const entry = target ? await app.get(target.uid) : undefined;
+        assertScope();
+        if (entry) {
+            if ((entry.title || `条目 ${target.uid}`) !== target.title) throw new Error('选中的条目标题已变更，请重新选择。');
+            entry.uid = target.uid;
+            latest.steps.push('读取已选条目 · 完成');
+            renderWorkMode();
+        }
         answer = await runWorkTurn({
-            instruction: message.mes, maxToolRounds, signal,
+            instruction: message.mes, entry, maxToolRounds, signal,
             request: async (messages, requestSignal) => {
                 assertScope();
-                return requestWorkReply(messages, requestSignal, api, model);
+                return requestWorkReply(messages, requestSignal, api, model, toolNames);
             },
             invoke: async (name, args) => {
                 assertScope();
                 const index = TOOL_NAMES.indexOf(name);
-                if (index === -1) return JSON.stringify({ error: '该工具不在本次工作台的授权范围。' });
+                if (!toolNames.includes(name)) return JSON.stringify({ error: '该工具不在本次工作台的授权范围。' });
+                if (target) {
+                    let parameters;
+                    try { parameters = typeof args === 'string' ? JSON.parse(args) : args; }
+                    catch { return JSON.stringify({ error: '工具参数无法解析。' }); }
+                    if (parameters?.uid !== target.uid) return JSON.stringify({ error: '本次只能读取或修改已选条目。' });
+                }
                 const output = await ToolManager.invokeFunctionTool(name, args);
                 const labels = ['搜索世界书', '读取世界书条目', '提交世界书修改'];
                 const result = output instanceof Error ? { error: output.message } : JSON.parse(output);
@@ -200,6 +225,7 @@ function renderRecords() {
     const book = settings().book;
     const drafts = data.drafts.filter(d => d.book === book);
     const history = data.history.filter(h => h.book === book);
+    draftsNode.closest('details').hidden = !drafts.length && settings().mode === 'direct';
     if (!drafts.length) draftsNode.append(el('small', '暂无待确认修改'));
     for (const draft of drafts) {
         const details = el('details', undefined, 'wbw-record');
@@ -219,12 +245,15 @@ function renderRecords() {
     for (const item of history.slice(0, 30)) {
         const details = el('details', undefined, 'wbw-record');
         details.append(el('summary', `${item.title} · ${item.status} · ${new Date(item.created).toLocaleString()}`));
+        if (item.status === '已应用') {
+            details.append(button('撤销', async () => { await app.undo(item.id); notice('已撤销。'); }));
+            if (item === history[0]) details.open = true;
+        }
         details.append(el('p', `理由：${item.reason || '未提供'}`));
         details.append(el('strong', '修改前'));
         details.append(el('pre', item.before?.content ?? '（新建条目）', 'wbw-content'));
         details.append(el('strong', '修改后'));
         details.append(el('pre', item.after.content || '', 'wbw-content'));
-        if (item.status === '已应用') details.append(button('撤销这次修改', async () => { await app.undo(item.id); notice('已撤销。'); }));
         historyNode.append(details);
     }
 }
@@ -236,35 +265,143 @@ function populateBooks() {
     if (settings().book && !names.includes(settings().book)) select.add(new Option(`${settings().book}（未找到）`, settings().book));
     select.value = settings().book || '';
 }
+async function populateEntries() {
+    if (!root) return;
+    const select = root.querySelector('[data-entry]');
+    const status = root.querySelector('[data-entry-status]');
+    const { book } = settings();
+    const context = ctx();
+    const request = entryLoad = Symbol();
+    const target = selectedTarget(book, context);
+    select.replaceChildren(new Option('由模型搜索条目', ''));
+    select.disabled = true;
+    status.textContent = '';
+    if (!book) return;
+    if (!supportsWorkMode(context)) {
+        status.textContent = '打开已保存的单人聊天后可点选具体条目。';
+        return;
+    }
+
+    status.textContent = '正在读取条目…';
+    try {
+        const { entries } = await readBook(book);
+        if (entryLoad !== request || !root) return;
+        const choices = Object.values(entries ?? {}).flatMap(entry => {
+            if (entry?.uid === undefined || entry.uid === null || entry.uid === '') return [];
+            const uid = Number(entry.uid);
+            return Number.isSafeInteger(uid) ? [{ uid, title: entry.comment || `条目 ${uid}`, keys: entry.key }] : [];
+        });
+        const titleCounts = new Map();
+        for (const { title } of choices) titleCounts.set(title, (titleCounts.get(title) ?? 0) + 1);
+        for (const { uid, title, keys } of choices) {
+            const keywords = Array.isArray(keys) && keys.length ? keys.join('、') + ' · ' : '';
+            const detail = titleCounts.get(title) > 1 ? `（${keywords}编号 ${uid}）` : '';
+            const option = new Option(title + detail, String(uid));
+            option.dataset.title = title;
+            select.add(option);
+        }
+        select.disabled = false;
+        if (target && !choices.some(item => item.uid === target.uid && item.title === target.title)) {
+            const stale = new Option(`${target.title}（请选择新目标）`, 'stale', false, true);
+            stale.disabled = true;
+            select.add(stale);
+            select.value = 'stale';
+            status.textContent = '当前选择已变化，请重新选择。';
+            return;
+        }
+        select.value = target ? String(target.uid) : '';
+        status.textContent = choices.length ? '' : '这本世界书没有可选条目。';
+    } catch (error) {
+        if (entryLoad === request && root) status.textContent = error.message;
+    }
+}
+async function showWorkbench() {
+    if (!root || openPopup) return;
+    document.querySelector('#options_button')?.click();
+    const { Popup, POPUP_TYPE } = ctx();
+    const popup = openPopup = new Popup(root, POPUP_TYPE.TEXT, '', { okButton: '完成', allowVerticalScrolling: true });
+    populateBooks();
+    renderRecords();
+    renderWorkMode();
+    void populateEntries();
+    try { await popup.show(); }
+    finally {
+        if (openPopup === popup) openPopup = undefined;
+        entryLoad = undefined;
+    }
+}
 function mount() {
     if (!active || root) return;
-    const container = document.querySelector('#extensions_settings2');
-    if (!container) { console.error('[世界书协作工作台] 找不到扩展设置区域'); return; }
-    root = document.createElement('div');
+    const menu = document.querySelector('#options .options-content');
+    if (!menu) { console.error('[世界书协作工作台] 找不到聊天操作菜单'); return; }
+    menuEntry = el('a');
+    menuEntry.dataset.worldbookWorkbench = '';
+    menuEntry.tabIndex = 0;
+    menuEntry.setAttribute('role', 'button');
+    menuEntry.append(el('i', undefined, 'fa-lg fa-solid fa-book'), el('span', '世界书协作工作台'));
+    menuEntry.addEventListener('click', event => {
+        event.stopPropagation();
+        void showWorkbench();
+    });
+    menuEntry.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            menuEntry.click();
+        }
+    });
+    menu.prepend(menuEntry);
+    root = el('div');
     root.id = 'worldbook-workbench';
-    root.className = 'inline-drawer';
-    root.innerHTML = `<div class="inline-drawer-toggle inline-drawer-header"><b>世界书协作工作台</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
-      <div class="inline-drawer-content">
-        <label class="checkbox_label"><input data-enabled type="checkbox">启用聊天工具</label>
-        <label>操作的世界书<select data-book class="text_pole"></select></label>
-        <label>修改方式<select data-mode class="text_pole"><option value="review">先确认，再应用</option><option value="direct">模型直接修改</option></select></label>
-        <small>在聊天中请模型搜索、修改或新建条目。需要启用酒馆的工具调用，且模型接口支持工具调用。世界书自动注入仍由酒馆的世界书绑定和触发规则控制。</small>
+    root.innerHTML = `<h3>世界书协作工作台</h3>
+        <label>世界书<select data-book class="text_pole"></select></label>
+        <label>编辑目标<select data-entry class="text_pole"></select></label>
+        <small data-entry-status role="status"></small>
         <label class="checkbox_label"><input data-work-mode type="checkbox">当前聊天使用世界书工作模式</label>
-        <small>在已保存的单人聊天里使用文字指令。每次只保存你的指令和最终回复，工具过程在工作台查看。</small>
-        <details><summary>最近一次世界书任务</summary><pre data-work-log class="wbw-content"></pre></details>
+        <label class="checkbox_label"><input data-enabled type="checkbox">启用聊天工具</label>
+        <label>修改方式<select data-mode class="text_pole"><option value="direct">直接修改，可撤销</option><option value="review">先确认，再应用</option></select></label>
         <div data-status class="wbw-status" role="status"></div>
-        <details open><summary>待确认修改</summary><div data-drafts></div></details>
-        <details><summary>修改记录与撤销</summary><small>记录存于当前浏览器；清理浏览器数据会删除记录。</small><div data-history></div></details>
-      </div>`;
-    container.append(root);
+        <details open><summary>修改记录与撤销</summary><small>记录保存在当前浏览器。</small><div data-history></div></details>
+        <details><summary>最近一次世界书任务</summary><pre data-work-log class="wbw-content"></pre></details>
+        <details open><summary>待确认修改</summary><div data-drafts></div></details>`;
     const s = settings();
     root.querySelector('[data-enabled]').checked = !!s.enabled;
     root.querySelector('[data-mode]').value = s.mode;
     populateBooks();
     root.querySelector('[data-enabled]').addEventListener('change', e => { s.enabled = e.target.checked; stopWork(); ctx().saveSettingsDebounced(); });
-    root.querySelector('[data-book]').addEventListener('change', e => { s.book = e.target.value; stopWork(); ctx().saveSettingsDebounced(); renderRecords(); });
+    root.querySelector('[data-book]').addEventListener('change', async e => {
+        if (s.book === e.target.value) return;
+        s.book = e.target.value;
+        stopWork();
+        const state = workState();
+        const hadTarget = Boolean(state?.target);
+        if (hadTarget) delete state.target;
+        ctx().saveSettingsDebounced();
+        renderRecords();
+        void populateEntries();
+        if (hadTarget) await ctx().saveChat();
+    });
+    root.querySelector('[data-entry]').addEventListener('change', async e => {
+        const c = ctx();
+        if (!supportsWorkMode(c)) return;
+        const state = c.chatMetadata[WORK_RECORD] = workState(c) ?? {};
+        stopWork();
+        if (e.target.value === '') {
+            delete state.target;
+        } else {
+            const uid = Number(e.target.value);
+            if (!Number.isSafeInteger(uid)) return;
+            const option = e.target.selectedOptions[0];
+            state.target = { book: s.book, uid, title: option.dataset.title };
+        }
+        await c.saveChat();
+    });
     root.querySelector('[data-book]').addEventListener('focus', populateBooks);
-    root.querySelector('[data-mode]').addEventListener('change', e => { s.mode = e.target.value; stopWork(); ctx().saveSettingsDebounced(); });
+    root.querySelector('[data-mode]').addEventListener('change', e => {
+        s.mode = e.target.value;
+        stopWork();
+        ctx().saveSettingsDebounced();
+        renderRecords();
+    });
     root.querySelector('[data-work-mode]').addEventListener('change', async e => {
         const c = ctx();
         if (!supportsWorkMode(c)) return;
@@ -314,6 +451,10 @@ export function disable() {
     c.eventSource.removeListener(c.eventTypes.GENERATION_STOPPED, stopWork);
     document.removeEventListener('DOMContentLoaded', mount);
     for (const name of TOOL_NAMES) ctx().unregisterFunctionTool(name);
+    entryLoad = undefined;
+    if (openPopup) void openPopup.completeCancelled();
+    menuEntry?.remove();
+    menuEntry = undefined;
     root?.remove();
     root = null;
 }

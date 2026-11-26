@@ -11,3 +11,19 @@
 #worldbook-workbench .wbw-record { margin: 0.6em 0; }
 #worldbook-workbench .wbw-status { margin: 0.5em 0; overflow-wrap: anywhere; }
 #worldbook-workbench select { width: 100%; }
+#worldbook-workbench {
+    display: grid;
+    gap: 0.55rem;
+    min-width: 0;
+    text-align: start;
+}
+#worldbook-workbench label:has(select) {
+    display: grid;
+    gap: 0.25rem;
+}
+#worldbook-workbench .wbw-record > .menu_button {
+    width: max-content;
+    max-width: 100%;
+    white-space: nowrap;
+    padding-inline: 0.65em;
+}

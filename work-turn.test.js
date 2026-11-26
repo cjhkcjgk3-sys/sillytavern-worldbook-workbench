@@ -65,3 +65,18 @@ test('停止后，迟到的模型回复无法触发写入', async () => {
     }), { name: 'AbortError' });
     assert.equal(invoked, false);
 });
+
+test('首轮请求包含已选条目的正文和版本，用户只需描述改法', async () => {
+    const entry = { uid: 0, title: '重名条目', content: '100', revision: 'fixture-revision' };
+    const result = await runWorkTurn({
+        instruction: '精炼一下这条。', entry, maxToolRounds: 2, signal: new AbortController().signal,
+        request: async messages => {
+            assert.equal(messages.filter(message => message.role === 'user').length, 1);
+            assert.ok(messages[1].content.includes(JSON.stringify(entry)));
+            assert.ok(messages[1].content.endsWith('精炼一下这条。'));
+            return { content: '示例回复' };
+        },
+        invoke: async () => { throw new Error('不应执行工具'); },
+    });
+    assert.equal(result, '示例回复');
+});
