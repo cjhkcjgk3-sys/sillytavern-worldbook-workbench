@@ -1,5 +1,8 @@
+import { chat_completion_sources, createGenerationParameters, getChatCompletionModel, oai_settings } from '/scripts/openai.js';
+import { ToolManager } from '/scripts/tool-calling.js';
 import { createWorldInfoEntry } from '/scripts/world-info.js'; // SillyTavern 1.19.0 host API
 import { makeWorkbench } from './core.js';
+import { runWorkTurn } from './work-turn.js';
 
 const ID = 'worldbook_workbench';
 const STORAGE = 'worldbook_workbench_v1';
@@ -7,6 +10,10 @@ const TOOL_NAMES = ['worldbook_workbench_search', 'worldbook_workbench_read', 'w
 let root;
 let app;
 let active = false;
+let pendingMessage;
+let running;
+const INTERCEPTOR = 'worldbookWorkbench_interceptGeneration';
+const WORK_RECORD = 'worldbook_workbench_mode';
 const ctx = () => SillyTavern.getContext();
 const settings = () => {
     const all = ctx().extensionSettings;
@@ -49,6 +56,138 @@ function button(label, action) {
         finally { node.disabled = false; }
     });
     return node;
+}
+function workState(context = ctx()) {
+    const state = context.chatMetadata?.[WORK_RECORD];
+    return state && typeof state === 'object' && !Array.isArray(state) ? state : undefined;
+}
+function supportsWorkMode(context) {
+    return Boolean(context.chatId && !context.groupId && context.chatMetadata && typeof context.saveReply === 'function'
+        && typeof context.saveChat === 'function');
+}
+function renderWorkMode() {
+    if (!root) return;
+    const context = ctx();
+    const toggle = root.querySelector('[data-work-mode]');
+    toggle.disabled = !supportsWorkMode(context);
+    toggle.checked = Boolean(workState(context)?.enabled);
+    const output = root.querySelector('[data-work-log]');
+    const latest = workState(context)?.latest;
+    output.textContent = Array.isArray(latest?.steps) ? [latest.status, ...latest.steps].join('\n') : '暂无任务记录';
+}
+function rememberSentMessage(index) {
+    const context = ctx();
+    const message = context.chat[index];
+    pendingMessage = workState(context)?.enabled && message?.is_user ? message : undefined;
+}
+function stopWork() {
+    running?.abort();
+}
+function changeChat() {
+    pendingMessage = undefined;
+    stopWork();
+    renderWorkMode();
+}
+async function requestWorkReply(messages, signal, api, model) {
+    const { generate_data } = await createGenerationParameters(api, model, 'normal', structuredClone(messages));
+    generate_data.tools = generate_data.tools?.filter(tool => TOOL_NAMES.includes(tool.function?.name));
+    if (generate_data.tools?.length !== TOOL_NAMES.length) throw new Error('当前请求没有启用完整的工作台工具。');
+    const response = await fetch('/api/backends/chat-completions/generate', {
+        method: 'POST',
+        headers: ctx().getRequestHeaders(),
+        body: JSON.stringify(generate_data),
+        signal,
+    }).catch(error => {
+        signal.throwIfAborted();
+        throw new Error('连接模型接口时发生网络错误。', { cause: error });
+    });
+    if (!response.ok) throw new Error(`模型接口请求失败（HTTP ${response.status}）。`);
+    const data = await response.json().catch(error => {
+        signal.throwIfAborted();
+        throw new Error('模型接口未返回有效的 JSON。', { cause: error });
+    });
+    if (data.error || !data.choices?.[0]?.message) throw new Error('模型接口没有返回可用结果。');
+    return data.choices[0].message;
+}
+
+async function interceptGeneration(_chat, _contextSize, abort, type) {
+    const context = ctx();
+    const state = workState(context);
+    const message = context.chat.findLast(item => item.is_user);
+    if (!active || !state?.enabled || !supportsWorkMode(context) || type !== 'normal' || !message || message !== pendingMessage) return;
+    pendingMessage = undefined;
+    abort(true);
+    if (running) {
+        notice('上一次世界书任务正在收尾，请稍后再发送。', true);
+        return;
+    }
+
+    const controller = new AbortController();
+    running = controller;
+    const { signal } = controller;
+    const { chatId, characterId } = context;
+    const { enabled, book, mode } = settings();
+    const belongsToChat = () => {
+        const current = ctx();
+        return active && current.chatId === chatId && current.characterId === characterId && !current.groupId
+            && current.chat.findLast(item => item.is_user) === message;
+    };
+    const assertScope = () => {
+        signal.throwIfAborted();
+        if (!belongsToChat() || !workState()?.enabled || !settings().enabled || settings().book !== book || settings().mode !== mode) {
+            throw new Error('聊天、世界书或工作方式已切换，已结束本次任务。');
+        }
+    };
+    const latest = state.latest = { status: '世界书任务进行中', steps: [] };
+    renderWorkMode();
+    let answer;
+    try {
+        if (!enabled || !book) throw new Error('请先启用聊天工具并选择一本世界书。');
+        if (!message.mes?.trim()) throw new Error('请输入文字指令。');
+        const api = structuredClone({ ...oai_settings, stream_openai: false, n: 1 });
+        const model = getChatCompletionModel(api);
+        const supported = [chat_completion_sources.OPENAI, chat_completion_sources.CUSTOM];
+        if (!supported.includes(api.chat_completion_source) || !ToolManager.isToolCallingSupported(api, model)) {
+            throw new Error('当前工作模式需要启用函数调用的 OpenAI 或自定义聊天补全连接。');
+        }
+        const maxToolRounds = Math.min(50, Math.max(1, Math.floor(Number(api.tool_call_recurse_limit) || 5)));
+        answer = await runWorkTurn({
+            instruction: message.mes, maxToolRounds, signal,
+            request: async (messages, requestSignal) => {
+                assertScope();
+                return requestWorkReply(messages, requestSignal, api, model);
+            },
+            invoke: async (name, args) => {
+                assertScope();
+                const index = TOOL_NAMES.indexOf(name);
+                if (index === -1) return JSON.stringify({ error: '该工具不在本次工作台的授权范围。' });
+                const output = await ToolManager.invokeFunctionTool(name, args);
+                const labels = ['搜索世界书', '读取世界书条目', '提交世界书修改'];
+                const result = output instanceof Error ? { error: output.message } : JSON.parse(output);
+                latest.steps.push(`${labels[index]} · ${result.error ? `失败：${result.error}` : result.status ?? '完成'}`);
+                renderWorkMode();
+                return JSON.stringify(result);
+            },
+        });
+        assertScope();
+        latest.status = '世界书任务已结束';
+    } catch (error) {
+        latest.status = signal.aborted ? '世界书任务已停止' : `世界书任务中断：${error.message}`;
+        answer = latest.steps.length ? [latest.status, ...latest.steps].join('\n\n') : latest.status;
+    }
+
+    try {
+        if (belongsToChat()) {
+            await ctx().saveReply({ type: 'normal', getMessage: answer });
+            await ctx().saveChat();
+        }
+    } catch (error) {
+        notice('保存聊天结果时发生错误，请在工作台核对本次操作。', true);
+        console.error('[世界书协作工作台]', error);
+    } finally {
+        running = undefined;
+        renderWorkMode();
+    }
 }
 function renderRecords() {
     if (!root) return;
@@ -110,6 +249,9 @@ function mount() {
         <label>操作的世界书<select data-book class="text_pole"></select></label>
         <label>修改方式<select data-mode class="text_pole"><option value="review">先确认，再应用</option><option value="direct">模型直接修改</option></select></label>
         <small>在聊天中请模型搜索、修改或新建条目。需要启用酒馆的工具调用，且模型接口支持工具调用。世界书自动注入仍由酒馆的世界书绑定和触发规则控制。</small>
+        <label class="checkbox_label"><input data-work-mode type="checkbox">当前聊天使用世界书工作模式</label>
+        <small>在已保存的单人聊天里使用文字指令。每次只保存你的指令和最终回复，工具过程在工作台查看。</small>
+        <details><summary>最近一次世界书任务</summary><pre data-work-log class="wbw-content"></pre></details>
         <div data-status class="wbw-status" role="status"></div>
         <details open><summary>待确认修改</summary><div data-drafts></div></details>
         <details><summary>修改记录与撤销</summary><small>记录存于当前浏览器；清理浏览器数据会删除记录。</small><div data-history></div></details>
@@ -119,11 +261,21 @@ function mount() {
     root.querySelector('[data-enabled]').checked = !!s.enabled;
     root.querySelector('[data-mode]').value = s.mode;
     populateBooks();
-    root.querySelector('[data-enabled]').addEventListener('change', e => { s.enabled = e.target.checked; ctx().saveSettingsDebounced(); });
-    root.querySelector('[data-book]').addEventListener('change', e => { s.book = e.target.value; ctx().saveSettingsDebounced(); renderRecords(); });
+    root.querySelector('[data-enabled]').addEventListener('change', e => { s.enabled = e.target.checked; stopWork(); ctx().saveSettingsDebounced(); });
+    root.querySelector('[data-book]').addEventListener('change', e => { s.book = e.target.value; stopWork(); ctx().saveSettingsDebounced(); renderRecords(); });
     root.querySelector('[data-book]').addEventListener('focus', populateBooks);
-    root.querySelector('[data-mode]').addEventListener('change', e => { s.mode = e.target.value; ctx().saveSettingsDebounced(); });
+    root.querySelector('[data-mode]').addEventListener('change', e => { s.mode = e.target.value; stopWork(); ctx().saveSettingsDebounced(); });
+    root.querySelector('[data-work-mode]').addEventListener('change', async e => {
+        const c = ctx();
+        if (!supportsWorkMode(c)) return;
+        const state = c.chatMetadata[WORK_RECORD] = workState(c) ?? {};
+        state.enabled = e.target.checked;
+        stopWork();
+        await c.saveChat();
+        renderWorkMode();
+    });
     renderRecords();
+    renderWorkMode();
 }
 function registerTools() {
     const c = ctx();
@@ -144,11 +296,22 @@ export function activate() {
     active = true;
     app = makeWorkbench({ read: readBook, save: saveBook, createEntry: createWorldInfoEntry, loadState, saveState, selectedBook: () => settings().book, mode: () => settings().mode, changed: renderRecords });
     registerTools();
+    globalThis[INTERCEPTOR] = interceptGeneration;
+    c.eventSource.on(c.eventTypes.MESSAGE_SENT, rememberSentMessage);
+    c.eventSource.on(c.eventTypes.CHAT_CHANGED, changeChat);
+    c.eventSource.on(c.eventTypes.GENERATION_STOPPED, stopWork);
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true });
     else mount();
 }
 export function disable() {
     active = false;
+    pendingMessage = undefined;
+    stopWork();
+    if (globalThis[INTERCEPTOR] === interceptGeneration) delete globalThis[INTERCEPTOR];
+    const c = ctx();
+    c.eventSource.removeListener(c.eventTypes.MESSAGE_SENT, rememberSentMessage);
+    c.eventSource.removeListener(c.eventTypes.CHAT_CHANGED, changeChat);
+    c.eventSource.removeListener(c.eventTypes.GENERATION_STOPPED, stopWork);
     document.removeEventListener('DOMContentLoaded', mount);
     for (const name of TOOL_NAMES) ctx().unregisterFunctionTool(name);
     root?.remove();
